@@ -1,0 +1,13 @@
+#Conflence_events
+
+python confluence_events.py --input-excel input_template.xlsx --excel events.xlsx
+
+api_finale
+# Preview without API calls
+python ga4_fetch_fill.py --input events_batch_fill.xlsx --date 05042026-07042026 --dry-run
+
+# Filter to specific modules (substring match, case-insensitive)
+python ga4_fetch_fill.py --input events_batch_fill.xlsx --date 05042026-07042026 --module "Video Tag Listing, Race Hub Page, Core Tracking"
+
+# Override credentials/property
+python ga4_fetch_fill.py --input events_batch_fill.xlsx --date 05042026-07042026 --credentials other.json --property 12345678
