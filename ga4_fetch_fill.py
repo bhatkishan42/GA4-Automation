@@ -98,6 +98,12 @@ COL_API         = "api_column"
 COL_REQUIRED    = "required"
 COL_RULES       = "rules_expected_values"   # read-only, has <<...>> templates
 COL_GA4_VALUES  = "ga4_expected_values"     # WRITE TARGET — filled by this script
+COL_STATUS      = "ga4_check_status"        # WRITE TARGET — coverage tracking
+
+# --- Value written into COL_STATUS ---
+# A non-blank value means "this script attempted to process this row in some
+# run". Downstream scripts count non-blank cells for coverage %.
+STATUS_CHECKED = "checked"
 
 # Columns that MUST exist in the input (others like Link / Module are optional
 # but preserved if present).
@@ -369,17 +375,21 @@ def read_input(path: str):
         sys.exit(f"[ERROR] Main sheet is missing column(s): {missing}. "
                  f"Got: {list(df.columns)}")
 
-    # Make sure both rules and output columns exist as object-typed columns.
+    # Make sure rules, output, and status columns exist as object-typed columns.
     if COL_RULES not in df.columns:
         print(f"[WARN] '{COL_RULES}' column not found -- creating it blank.")
         df[COL_RULES] = ""
     if COL_GA4_VALUES not in df.columns:
         print(f"[INFO] '{COL_GA4_VALUES}' column not found -- creating it blank.")
         df[COL_GA4_VALUES] = ""
+    if COL_STATUS not in df.columns:
+        print(f"[INFO] '{COL_STATUS}' column not found -- creating it blank.")
+        df[COL_STATUS] = ""
 
     # Force object dtype so we can write strings back without LossySetitemError.
     df[COL_RULES]      = df[COL_RULES].fillna("").astype(object)
     df[COL_GA4_VALUES] = df[COL_GA4_VALUES].fillna("").astype(object)
+    df[COL_STATUS]     = df[COL_STATUS].fillna("").astype(object)
 
     # Drop fully blank rows (no event_name).
     df = df[df[COL_EVENT].notna() & (df[COL_EVENT].astype(str).str.strip() != "")]
@@ -658,6 +668,37 @@ def fetch_from_ga4(client, property_id, eligible_df, platform_to_streams,
 # Fill — writes ONLY into ga4_expected_values, never touches rules_expected_values
 # --------------------------------------------------------------------------- #
 
+def _is_anchorless_only(rules_raw) -> bool:
+    """
+    True if rules contains <<...>> templates AND every template is anchorless
+    (no literal text outside the brackets). Used to distinguish 'we
+    deliberately skipped this row' from 'we queried and got nothing'.
+
+    Returns False for blank rules and for rules with no templates at all
+    (those are valid 'no filter, return everything' cases).
+    """
+    if is_blank(rules_raw):
+        return False
+    rules_str = str(rules_raw)
+    if "<<" not in rules_str or ">>" not in rules_str:
+        return False
+    seen_template = False
+    for chunk in rules_str.split("|"):
+        chunk = chunk.strip()
+        if "<<" not in chunk or ">>" not in chunk:
+            continue
+        first = chunk.find("<<")
+        last  = chunk.rfind(">>")
+        if last <= first:
+            continue
+        seen_template = True
+        prefix = chunk[:first]
+        suffix = chunk[last + 2:]
+        if prefix or suffix:
+            return False  # found at least one anchored template
+    return seen_template  # only True if we saw templates AND all were anchorless
+
+
 def fill_ga4_values(df: pd.DataFrame, actual, events_found, invalid_dims,
                     scope_mask=None):
     """
@@ -666,12 +707,19 @@ def fill_ga4_values(df: pd.DataFrame, actual, events_found, invalid_dims,
 
     `scope_mask` (optional) is a boolean Series. When provided, only rows
     where the mask is True are touched -- rows outside the mask are left
-    completely untouched. This is how `--module` keeps unfiltered rows
-    intact during a partial run.
+    completely untouched.
 
-    Returns counters: (filled, empty, invalid_dim, event_nf).
+    Status (`ga4_check_status`) is intentionally NOT written here. It's
+    computed in a separate post-processing pass (`mark_checked_status`)
+    so that "checked" tracks whether GA4 actually returned data for the
+    row, including data from earlier runs that's already in the file.
+
+    Returns counters: (filled, no_data, invalid_dim, event_nf,
+                       skipped_no_api, skipped_anchorless). These are for
+    the run's console summary -- they are NOT written to the sheet.
     """
-    filled = empty = invalid_dim = event_nf = 0
+    filled = no_data = invalid_dim = event_nf = 0
+    skipped_no_api = skipped_anchorless = 0
 
     for i, row in df.iterrows():
         if scope_mask is not None and not bool(scope_mask.loc[i]):
@@ -681,8 +729,14 @@ def fill_ga4_values(df: pd.DataFrame, actual, events_found, invalid_dims,
         # Retry safety: never overwrite a row that already has a value.
         if not is_blank(row[COL_GA4_VALUES]):
             continue
+
         api_dim = row["_api_clean"]
+
         if not isinstance(api_dim, str) or not api_dim:
+            skipped_no_api += 1
+            continue
+        if _is_anchorless_only(row[COL_RULES]):
+            skipped_anchorless += 1
             continue
 
         platform_lc = str(row[COL_PLATFORM]).strip().lower()
@@ -699,13 +753,76 @@ def fill_ga4_values(df: pd.DataFrame, actual, events_found, invalid_dims,
         ga4_values = actual.get(key, {}).get(api_dim, set())
         expanded = expand_cell(row[COL_RULES], ga4_values)
         if not expanded:
-            empty += 1
+            no_data += 1
             continue
 
         df.at[i, COL_GA4_VALUES] = "|".join(sorted(expanded))
         filled += 1
 
-    return filled, empty, invalid_dim, event_nf
+    return filled, no_data, invalid_dim, event_nf, skipped_no_api, skipped_anchorless
+
+
+# Parameter-name value that identifies the event-level row (the row that
+# represents the event itself rather than one of its parameters). Used by
+# the rollup step in mark_checked_status. Compared case-insensitively.
+EVENT_LEVEL_PARAM_NAME = "event"
+
+
+def mark_checked_status(df: pd.DataFrame, scope_mask=None) -> tuple:
+    """
+    Walk in-scope rows and mark `ga4_check_status` according to the policy:
+
+      1. PARAMETER ROW: marked 'checked' iff its ga4_expected_values is
+         non-empty. (i.e. this row's GA4 query actually returned a value.)
+      2. EVENT-LEVEL ROW (parameter_name == 'event'): marked 'checked' iff
+         AT LEAST ONE parameter row of the same (event_name, platform) is
+         itself 'checked' by rule 1.
+
+    Out-of-scope rows are never touched. Existing 'checked' status from
+    earlier runs on out-of-scope rows is preserved as-is.
+
+    This function is idempotent inside scope: re-running recomputes
+    'checked' from the current state of ga4_expected_values, so the column
+    always reflects what's currently true.
+
+    Returns (param_checked, event_checked) -- two counts for the run summary.
+    """
+    if scope_mask is None:
+        scope_mask = pd.Series([True] * len(df), index=df.index)
+
+    has_value = ~df[COL_GA4_VALUES].apply(is_blank)
+
+    # Rule 1: parameter rows with GA4 values -> 'checked'
+    param_mask = scope_mask & has_value
+    df.loc[param_mask, COL_STATUS] = STATUS_CHECKED
+    param_checked = int(param_mask.sum())
+
+    # Rule 2: event-level rollup. For each (event_name, platform) where any
+    # parameter row got data, mark the event-level row 'checked'.
+    event_checked = 0
+    if param_mask.any():
+        # Find every (event, platform) that has at least one filled param row.
+        events_with_data = set()
+        for (ev, pl), _ in df.loc[param_mask].groupby([COL_EVENT, COL_PLATFORM]):
+            events_with_data.add((str(ev).strip(), str(pl).strip()))
+
+        # Mark the event-level row(s) for those events.
+        param_lower = df[COL_PARAM].astype(str).str.strip().str.lower()
+        ev_str = df[COL_EVENT].astype(str).str.strip()
+        pl_str = df[COL_PLATFORM].astype(str).str.strip()
+        for ev, pl in events_with_data:
+            event_row_mask = (
+                scope_mask
+                & (ev_str == ev)
+                & (pl_str == pl)
+                & (param_lower == EVENT_LEVEL_PARAM_NAME)
+            )
+            n = int(event_row_mask.sum())
+            if n:
+                df.loc[event_row_mask, COL_STATUS] = STATUS_CHECKED
+                event_checked += n
+
+    return param_checked, event_checked
 
 
 # --------------------------------------------------------------------------- #
@@ -716,7 +833,7 @@ def fill_ga4_values(df: pd.DataFrame, actual, events_found, invalid_dims,
 # (e.g. Link, comments) are appended after these in their original order.
 MAIN_COLUMN_ORDER = [
     "link", COL_MODULE, COL_EVENT, COL_PLATFORM, COL_PARAM,
-    COL_BQ, COL_API, COL_REQUIRED, COL_RULES, COL_GA4_VALUES,
+    COL_BQ, COL_API, COL_REQUIRED, COL_RULES, COL_GA4_VALUES, COL_STATUS,
 ]
 
 
@@ -967,19 +1084,29 @@ def main():
     except Exception as e:
         sys.exit(f"[ERROR] GA4 authentication/fetch failed: {e}")
 
-    filled, empty, inv_dim, ev_nf = fill_ga4_values(
+    filled, no_data, inv_dim, ev_nf, skp_no_api, skp_anchorless = fill_ga4_values(
         df, actual, found, invalid_dims, scope_mask=in_scope,
     )
+
+    # Compute / refresh the ga4_check_status column based on what's now
+    # in ga4_expected_values (including data from prior runs already on disk).
+    param_checked, event_checked = mark_checked_status(df, scope_mask=in_scope)
+
     write_output_atomic(df, output_path, other_sheets, main_sheet_name)
+
+    attempted = filled + no_data + inv_dim + ev_nf + skp_no_api + skp_anchorless
 
     print("")
     print("=" * 60)
     print("  FETCH-AND-FILL SUMMARY")
     print("=" * 60)
-    print(f"  Rows filled with GA4 values         : {filled}")
-    print(f"  Rows with no values in GA4          : {empty}")
-    print(f"  Rows with invalid api_column (run)  : {inv_dim}")
-    print(f"  Rows whose (platform,event) missing : {ev_nf}")
+    print(f"  Rows attempted in this run          : {attempted}")
+    print(f"    -> filled with GA4 values         : {filled}")
+    print(f"    -> queried but no data            : {no_data}")
+    print(f"    -> event not found in date range  : {ev_nf}")
+    print(f"    -> dimension rejected by GA4      : {inv_dim}")
+    print(f"    -> skipped (api_column unusable)  : {skp_no_api}")
+    print(f"    -> skipped (anchorless template)  : {skp_anchorless}")
     print(f"  Rows already had ga4_expected_values: {already_filled}")
     print(f"  Rows with unusable api_column       : {invalid_api_count}")
     print(f"  Rows with blank 'required'          : {blank_required}")
@@ -987,6 +1114,12 @@ def main():
     if skipped_platforms:
         print(f"  Platforms skipped (no mapping)      : {sorted(skipped_platforms)}")
     print(f"  Output -> {output_path}")
+    print("=" * 60)
+    print(f"  ga4_check_status (in-scope) :")
+    print(f"    parameter rows with GA4 data     : {param_checked}")
+    print(f"    event-level rows rolled up       : {event_checked}")
+    print(f"  ('checked' = parameter row got GA4 data,")
+    print(f"   OR event row has at least one such parameter)")
     print("=" * 60)
 
 
