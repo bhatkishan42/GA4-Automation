@@ -1,14 +1,22 @@
-# Version 21 — QA Completed metrics driven by ga4_check_status column
-# ------------------------------------------------------------
-# Changes vs v20:
-#   - read_excel() now captures ga4_check_status per param row
-#   - QA Completed (events) = unique events with ≥1 row marked "checked"
-#   - QA Completed (modules) = unique modules with ≥1 row marked "checked"
-#   - Per-module table: Events count filtered to checked-only events
-#   - Validation sheet still shows ALL rows (so unchecked work stays visible)
-# Everything else (status set, summary sheet, racing theme, totals,
-# data bars, hidden cols/rows, console output) is unchanged.
+# Version 28 — Detect "(not set)" tokens in GA4 actual values
+# (was: Version 27 — Add --mode CLI flag for normal vs ignore-required)
+#
+# What v28 adds:
+#   - A small token-detector that flags rows whose ga4_actual_value contains
+#     "(not set)" (or close variants — "(not_set)", "not set", "<not set>").
+#     "(not set)" is what GA4 puts in dimension columns when an event fires
+#     without that parameter populated, so it's almost always a real signal
+#     rather than a clean value.
+#   - When detected, an annotation is appended to the row's Comments column:
+#     [Note: contains (not set)] — non-destructive, so a Pass row stays Pass
+#     and a Failed row stays Failed but you still see the (not set) flag.
+#   - End-of-run console line shows how many rows tripped the detector.
+#
+# Detection happens AFTER status decision and applies on QA'd rows only —
+# unchecked rows still show up as Manual Check with no annotation, since
+# we haven't really evaluated them yet.
 
+import argparse
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -18,8 +26,8 @@ from openpyxl.formatting.rule import DataBarRule
 # =========================
 # CONFIG — only change these
 # =========================
-RULES_FILE  = "data_check.xlsx"            # the Rules / spec workbook (now also holds GA4 values)
-SHEET_NAME  = "data_check"
+RULES_FILE  = "ignore_required.xlsx"            # the Rules / spec workbook (now also holds GA4 values)
+SHEET_NAME  = "API Confluence (Final Version)"
 OUTPUT_FILE = "Api_validation_output.xlsx"
 
 # If True, appends timestamp to output filename (keeps run history)
@@ -37,21 +45,21 @@ QA_CHECKED_MARKER = "checked"
 # =========================
 # Racing THEME COLORS (Summary sheet)
 # =========================
-COLOR_BG             = "15151E"   # Excel - Summary sheet background
-COLOR_HEADER         = "FF1E00"   # Excel - section header bands & title bar (bright red)
-COLOR_SUBHEADER      = "1E1E2A"   # Excel - sub-header rows & column headers
-COLOR_ROW_ODD        = "1A1A27"   # Excel - odd data row fill
-COLOR_ROW_EVEN       = "22222F"   # Excel - even data row fill
-COLOR_TEXT_PRIMARY   = "FFFFFF"   # Excel - primary text (titles, values)
-COLOR_TEXT_SECONDARY = "E8E8E8"   # Excel - secondary text (labels)
-COLOR_TEXT_MUTED     = "C0C0C0"   # Excel - muted text (timestamp, subtitles)
-COLOR_BORDER         = "3A3A4A"   # Excel - cell borders
-COLOR_BAR_FILL       = "00B050"   # Excel - progress bar fill (green; renders as white→green gradient)
+COLOR_BG             = "15151E"
+COLOR_HEADER         = "FF1E00"
+COLOR_SUBHEADER      = "1E1E2A"
+COLOR_ROW_ODD        = "1A1A27"
+COLOR_ROW_EVEN       = "22222F"
+COLOR_TEXT_PRIMARY   = "FFFFFF"
+COLOR_TEXT_SECONDARY = "E8E8E8"
+COLOR_TEXT_MUTED     = "C0C0C0"
+COLOR_BORDER         = "3A3A4A"
+COLOR_BAR_FILL       = "00B050"
 
-# Validation sheet — traffic-light colors painted directly on Status cells
-COLOR_VAL_GREEN      = "63BE7B"   # Validation - Pass
-COLOR_VAL_YELLOW     = "FFEB84"   # Validation - Partial - Missing / Partial - Additional
-COLOR_VAL_RED        = "F8696B"   # Validation - Failed
+# Validation sheet — traffic-light colors for the Status column
+COLOR_VAL_GREEN      = "63BE7B"
+COLOR_VAL_YELLOW     = "FFEB84"
+COLOR_VAL_RED        = "F8696B"
 
 BG_FILL       = PatternFill("solid", fgColor=COLOR_BG)
 HEADER_FILL   = PatternFill("solid", fgColor=COLOR_HEADER)
@@ -76,10 +84,34 @@ FONT_VALUE_BOLD = Font(name="Calibri", size=11, bold=True, color=COLOR_TEXT_PRIM
 
 
 # =========================
-# NORMALIZE HELPER
+# NORMALIZE HELPERS
 # =========================
 def normalize(value):
     return str(value).strip().lower()
+
+
+# Tokens GA4 emits when a parameter wasn't actually populated on an event.
+# All comparisons are done case-insensitively and after stripping whitespace,
+# so this list only needs the canonical lower-case forms.
+NOT_SET_TOKENS = {
+    "(not set)",
+    "(not_set)",
+    "not set",
+    "<not set>",
+}
+
+
+def _has_not_set(raw):
+    """True iff the raw cell value contains a recognised (not set) token.
+
+    Operates on the RAW cell (pre-split, pre-normalize) so we catch the
+    token regardless of which side of a pipe it's on. Returns False for
+    empty/NaN cells.
+    """
+    if raw is None or pd.isna(raw):
+        return False
+    s = str(raw).lower()
+    return any(t in s for t in NOT_SET_TOKENS)
 
 
 def split_values(raw):
@@ -115,13 +147,15 @@ def read_excel(file_path, sheet_name):
 
     df = df[df["event_name"].notna() & (df["event_name"].astype(str).str.strip() != "")]
 
-    # Back-compat: alias old column name if present
+    # Back-compat: alias old column names if present
     if "expected_value" in df.columns and "rules_expected_values" not in df.columns:
         df = df.rename(columns={"expected_value": "rules_expected_values"})
+    if "ga4_expected_values" in df.columns and "ga4_actual_value" not in df.columns:
+        df = df.rename(columns={"ga4_expected_values": "ga4_actual_value"})
 
     # Sanity-check required columns
     required_cols = {"event_name", "platform", "parameter_name",
-                     "rules_expected_values", "ga4_expected_values"}
+                     "rules_expected_values", "ga4_actual_value"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(
@@ -134,12 +168,21 @@ def read_excel(file_path, sheet_name):
         print("⚠ ga4_check_status column not found — QA Completed metrics will fall back "
               "to counting all events/modules in the spec.\n")
 
+    # Capture original column order for downstream output passthrough
+    input_columns = list(df.columns)
+
     events = {}
     duplicates = []
+
+    # Track input-file order of modules (first-appearance, post empty→Uncategorized).
+    # This is what later drives the Summary sheet's Per-Module Breakdown ordering.
+    module_order = []
+    seen_modules = set()
 
     for _, row in df.iterrows():
         raw_mod         = row.get("module", "")
         module          = "" if pd.isna(raw_mod) else str(raw_mod).strip()
+        module_label    = module if module else "Uncategorized"
         raw_event       = str(row["event_name"])
         platform        = normalize(row.get("platform", "all"))
         parameter_name  = normalize(row["parameter_name"])
@@ -148,23 +191,33 @@ def read_excel(file_path, sheet_name):
         api_column      = "" if pd.isna(row.get("api_column", "")) else str(row.get("api_column", "")).strip()
 
         rules_expected  = split_values(row.get("rules_expected_values"))
-        ga4_actual      = split_values(row.get("ga4_expected_values"))
+        ga4_actual_raw  = row.get("ga4_actual_value")
+        ga4_actual      = split_values(ga4_actual_raw)
 
         required        = str(row.get("required", "")).strip().lower() in ["yes", "true", "1"]
 
-        # NEW: per-row QA-checked flag
+        # Per-row QA-checked flag
         if has_check_status_col:
             check_raw = row.get("ga4_check_status")
             check_str = "" if pd.isna(check_raw) else str(check_raw).strip().lower()
             qa_checked = (check_str == QA_CHECKED_MARKER.lower())
         else:
-            # Fallback — treat every row as checked when the column is absent
             qa_checked = True
+
+        # Capture the raw row as a dict (for output passthrough). NaN -> ""
+        raw_row = {col: ("" if pd.isna(row[col]) else row[col]) for col in input_columns}
+
+        # First-appearance module order
+        if module_label not in seen_modules:
+            seen_modules.add(module_label)
+            module_order.append(module_label)
 
         event_names = [normalize(e) for e in raw_event.split("|") if e.strip()]
 
         for event_name in event_names:
-            key = f"{event_name}||{platform}"
+            # Key includes module so the same event_name under two different
+            # modules doesn't collapse into one bucket. (See v26 banner.)
+            key = f"{module_label}||{event_name}||{platform}"
 
             if key not in events:
                 events[key] = {
@@ -177,11 +230,17 @@ def read_excel(file_path, sheet_name):
             existing_params = {p["parameter_name"] for p in events[key]["params"]}
             if parameter_name in existing_params:
                 duplicates.append({
+                    "module"    : module_label,
                     "event"     : event_name,
                     "platform"  : platform,
                     "parameter" : parameter_name,
                 })
                 continue
+
+            # For pipe-separated events, ensure the row's event_name field shows
+            # the specific event_name being validated (not the original "evt1|evt2")
+            row_for_this_event = dict(raw_row)
+            row_for_this_event["event_name"] = event_name
 
             events[key]["params"].append({
                 "parameter_name" : parameter_name,
@@ -189,23 +248,25 @@ def read_excel(file_path, sheet_name):
                 "api_column"     : api_column,
                 "rules_expected" : rules_expected,
                 "ga4_actual"     : ga4_actual,
+                "ga4_actual_raw" : ga4_actual_raw,
                 "required"       : required,
                 "qa_checked"     : qa_checked,
+                "raw_row"        : row_for_this_event,
             })
 
     if duplicates:
         print(f"\n⚠ Found {len(duplicates)} duplicate parameter definitions (kept first occurrence):")
         for d in duplicates:
-            print(f"    - {d['event']} [{d['platform']}] → {d['parameter']}")
+            print(f"    - [{d['module']}] {d['event']} [{d['platform']}] → {d['parameter']}")
         print()
 
-    return events
+    return events, input_columns, module_order
 
 
 # =========================
 # VALIDATE  (row-internal compare — no external dataframe)
 # =========================
-def validate(events):
+def validate(events, ignore_required=False):
     results = []
 
     for key, config in events.items():
@@ -213,10 +274,8 @@ def validate(events):
         event_name = config["event_name"]
         platform   = config["platform"]
 
-        # An event counts as QA-completed if any of its rows was checked.
         event_qa_checked = any(p["qa_checked"] for p in config["params"])
 
-        # Event "found in GA4" if at least one required param has values populated.
         event_found = any(p["ga4_actual"] for p in config["params"] if p["required"])
         if not event_found:
             event_found = any(p["ga4_actual"] for p in config["params"])
@@ -227,17 +286,25 @@ def validate(events):
 
         for param in config["params"]:
             param_name      = param["parameter_name"]
-            bq_col          = param["bq_column"]
-            api_col         = param["api_column"]
             expected_values = param["rules_expected"]
             ga4_actual      = param["ga4_actual"]
             required        = param["required"]
-            required_label  = "YES" if required else "NO"
             qa_checked      = param["qa_checked"]
+
+            # In ignore-required mode every QA'd row is treated as required
+            # so the value matcher runs on it. Original `required` is left
+            # alone for any other consumer that might care.
+            effective_required = True if ignore_required else required
 
             actual_values_sorted = sorted(set(ga4_actual))
 
-            if not required:
+            # Only validate rows that have been QA'd. Unchecked rows pass through
+            # as "Manual Check" so they stay visible but don't get validated.
+            if not qa_checked:
+                status = "NOT REQUIRED"
+                print(f"  - {param_name} | not QA'd yet — skipped")
+
+            elif not effective_required:
                 status = "NOT REQUIRED"
                 print(f"  - {param_name} | NOT REQUIRED — skipped")
 
@@ -258,7 +325,7 @@ def validate(events):
                 else:
                     status = "FAIL — no expected values found in GA4"
 
-            if required:
+            if effective_required and qa_checked:
                 icon = (
                     "✔" if status == "PASS"
                     else "~" if any(x in status for x in ["no expected", "PARTIAL"])
@@ -268,23 +335,31 @@ def validate(events):
 
             display_status, comments = status_to_columns(status)
 
-            results.append({
-                "module"                : module,
-                "event_name"            : event_name,
-                "platform"              : platform.upper(),
-                "event_found_in_ga4"    : "YES" if event_found else "NO",
-                "parameter_name"        : param_name,
-                "bq_column"             : bq_col,
-                "api_column"            : api_col,
-                "required"              : required_label,
-                "rules_expected_values" : "|".join(expected_values) if expected_values else "(any)",
-                "ga4_actual_values"     : "|".join(actual_values_sorted),
-                "Status"                : display_status,
-                "Comments"              : comments,
-                "ga4_check_status"      : "checked" if qa_checked else "",
-                "status"                : status,            # internal — categorize() & summary
-                "_qa_checked"           : qa_checked,         # internal — summary metrics
-            })
+            # (not set) detection — annotate any QA'd row whose raw GA4 cell
+            # contains a recognised "(not set)" token. We do this regardless
+            # of pass/fail so that even a passing row carries the flag.
+            has_not_set = qa_checked and _has_not_set(param.get("ga4_actual_raw"))
+            if has_not_set:
+                note = "[Note: contains (not set)]"
+                comments = f"{comments} {note}".strip() if comments else note
+
+            # Start with the full original row, then attach computed fields
+            result_row = dict(param["raw_row"])
+            result_row["Status"]   = display_status
+            result_row["Comments"] = comments
+            # Internal-only fields (dropped before writing the sheet)
+            result_row["_status_internal"] = status
+            result_row["_qa_checked"]      = qa_checked
+            result_row["_has_not_set"]     = has_not_set
+            # For the summary builders that group by these
+            result_row["_module"]     = module
+            result_row["_event_name"] = event_name
+            result_row["_platform"]   = platform.upper()
+            # _required reflects the EFFECTIVE required-ness, which is what
+            # the Summary's Modules Completed tally cares about.
+            result_row["_required"]   = "YES" if effective_required else "NO"
+
+            results.append(result_row)
 
     return pd.DataFrame(results)
 
@@ -343,30 +418,30 @@ def categorize(status):
     return "FAIL"
 
 
-def build_metrics_for_platform(result_df, platform_label, total_events_spec, total_modules_spec):
+def build_metrics_for_platform(result_df, platform_label, total_events_spec,
+                               total_modules_spec, module_order):
     """Compute completion-rate metrics + per-module param table for one platform.
 
-    QA Completed metrics are driven by ga4_check_status:
+    QA Completed metrics + Per-module table are driven by ga4_check_status:
       - QA Completed (events)  = unique events with ≥1 row marked "checked"
       - QA Completed (modules) = unique modules with ≥1 row marked "checked"
+      - Per-module rows         = only show modules that have ≥1 checked row,
+                                  ordered by first appearance in the input file.
     """
-    df = result_df[result_df["platform"].str.upper() == platform_label].copy()
-    df["module_label"] = df["module"].replace("", "Uncategorized").fillna("Uncategorized")
-    df["bucket"]       = df["status"].apply(categorize)
+    df = result_df[result_df["_platform"].str.upper() == platform_label].copy()
+    df["module_label"] = df["_module"].replace("", "Uncategorized").fillna("Uncategorized")
+    df["bucket"]       = df["_status_internal"].apply(categorize)
 
-    # -- Slice the rows that have been QA'd (any row with ga4_check_status == "checked")
     checked_df = df[df["_qa_checked"] == True]
 
-    qa_events_completed  = checked_df["event_name"].nunique()  if len(checked_df) else 0
+    qa_events_completed  = checked_df["_event_name"].nunique()  if len(checked_df) else 0
     qa_modules_completed = checked_df["module_label"].nunique() if len(checked_df) else 0
 
-    # -- Spec-wide counts (kept for reference / backward compat)
     validated   = df[df["bucket"] != "EXCLUDED"]
-    events_acc  = df["event_name"].nunique() if len(df) else 0
+    events_acc  = df["_event_name"].nunique() if len(df) else 0
     modules_acc = df["module_label"].nunique() if len(df) else 0
 
-    # -- Modules where every required param passes (full pass; informational only)
-    required = df[df["required"] == "YES"]
+    required = df[df["_required"] == "YES"]
     modules_completed = 0
     if not required.empty:
         for _, grp in required.groupby("module_label"):
@@ -375,10 +450,10 @@ def build_metrics_for_platform(result_df, platform_label, total_events_spec, tot
 
     metrics = {
         "Total Events"             : total_events_spec,
-        "Events Accounted"         : qa_events_completed,                         # ← QA-driven
+        "Events Accounted"         : qa_events_completed,
         "Event Completion %"       : round(qa_events_completed  / total_events_spec  * 100, 2) if total_events_spec  else 0.0,
         "Modules"                  : total_modules_spec,
-        "Modules Worked On"        : qa_modules_completed,                        # ← QA-driven
+        "Modules Worked On"        : qa_modules_completed,
         "Module Progress %"        : round(qa_modules_completed / total_modules_spec * 100, 2) if total_modules_spec else 0.0,
         "Modules Completed"        : modules_completed,
         "Module Completion %"      : round(modules_completed / total_modules_spec * 100, 2) if total_modules_spec else 0.0,
@@ -387,28 +462,41 @@ def build_metrics_for_platform(result_df, platform_label, total_events_spec, tot
         "Total Parameters Checked" : len(validated),
     }
 
-    # Per-module param breakdown — Events column reflects checked-only events
+    # Build per-module rows. Use sort=False on groupby so we don't fight the
+    # explicit reorder we apply right after.
     rows = []
-    for mod, grp in validated.groupby("module_label"):
-        n  = len(grp)
-        p  = int((grp["bucket"] == "PASS").sum())
-        pp = int((grp["bucket"] == "PARTIAL").sum())
-        fl = int((grp["bucket"] == "FAIL").sum())
+    for mod, grp in checked_df.groupby("module_label", sort=False):
+        mod_validated = grp[grp["bucket"] != "EXCLUDED"]
+        n  = len(mod_validated)
+        p  = int((mod_validated["bucket"] == "PASS").sum())
+        pp = int((mod_validated["bucket"] == "PARTIAL").sum())
+        fl = int((mod_validated["bucket"] == "FAIL").sum())
 
-        # Events count for this module = unique events that have any checked row
-        checked_events_in_mod = grp[grp["_qa_checked"] == True]["event_name"].nunique()
+        events_in_mod = grp["_event_name"].nunique()
+
+        if n == 0:
+            continue
 
         assert p + pp + fl == n, f"Math mismatch for {mod}: {p}+{pp}+{fl}!={n}"
         rows.append({
             "Module"     : mod,
-            "Events"     : checked_events_in_mod,
+            "Events"     : events_in_mod,
             "Parameters" : n,
             "PASS"       : p,
             "PARTIAL"    : pp,
             "FAIL"       : fl,
             "Pass %"     : round(p / n * 100, 1) if n else 0.0,
         })
-    module_param_df = pd.DataFrame(rows).sort_values("Module").reset_index(drop=True) if rows else pd.DataFrame()
+
+    if rows:
+        order_idx = {m: i for i, m in enumerate(module_order)}
+        # Anything not in module_order (shouldn't happen, but be safe) sinks to
+        # the end while preserving relative order.
+        sentinel = len(module_order)
+        rows.sort(key=lambda r: order_idx.get(r["Module"], sentinel))
+        module_param_df = pd.DataFrame(rows).reset_index(drop=True)
+    else:
+        module_param_df = pd.DataFrame()
 
     return metrics, module_param_df
 
@@ -451,7 +539,8 @@ def style_cell(cell, value=None, fill=None, font=None, border=CELL_BORDER, align
         cell.number_format = num_format
 
 
-def write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_params):
+def write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_params,
+                        module_order, mode_label="Normal"):
     sheet_name = "Summary"
     if sheet_name in wb.sheetnames:
         del wb[sheet_name]
@@ -461,14 +550,14 @@ def write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_pa
     ws.sheet_view.showGridLines = False
     ws.sheet_properties.tabColor = COLOR_HEADER
 
-    # ---- TITLE ----
     style_cell(ws.cell(row=1, column=1, value="GA4 EVENT VALIDATION  |  SUMMARY"),
                fill=HEADER_FILL, font=FONT_TITLE, border=None)
     ws.merge_cells("A1:N1")
     ws.row_dimensions[1].height = 40
 
     style_cell(ws.cell(row=2, column=1,
-               value=f"Generated: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%B %d, %Y at %I:%M %p IST')}"),
+               value=(f"Generated: {datetime.now(ZoneInfo('Asia/Kolkata')).strftime('%B %d, %Y at %I:%M %p IST')}"
+                      f"  |  Mode: {mode_label}")),
                fill=BG_FILL, font=FONT_SUBTITLE, border=None)
     ws.merge_cells("A2:N2")
     ws.row_dimensions[2].height = 20
@@ -577,7 +666,14 @@ def write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_pa
 
     app_modules = set(app_mod_params["Module"]) if not app_mod_params.empty else set()
     web_modules = set(web_mod_params["Module"]) if not web_mod_params.empty else set()
-    all_modules = sorted(app_modules | web_modules)
+    present     = app_modules | web_modules
+
+    # Use input-file order, filtered down to modules that actually appear in
+    # either platform. Anything unexpectedly missing from module_order goes
+    # to the end (sorted, just so the failure mode is at least deterministic).
+    all_modules = [m for m in module_order if m in present]
+    leftover    = sorted(present - set(all_modules))
+    all_modules.extend(leftover)
 
     app_lookup = app_mod_params.set_index("Module").to_dict(orient="index") if not app_mod_params.empty else {}
     web_lookup = web_mod_params.set_index("Module").to_dict(orient="index") if not web_mod_params.empty else {}
@@ -651,40 +747,92 @@ def write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_pa
 
 
 # =========================
+# CLI
+# =========================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "GA4 event validation. Reads the rules + GA4 actual values from "
+            "the same workbook and writes Validation + Summary sheets."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["normal", "ignore-required"],
+        default="normal",
+        help=(
+            "normal (default): only required=yes rows are value-matched; "
+            "non-required rows are marked Manual Check. "
+            "ignore-required: every QA'd row is value-matched regardless of "
+            "the required column — useful for quick coverage scans."
+        ),
+    )
+    return parser.parse_args()
+
+
+# =========================
 # MAIN
 # =========================
 def main():
+    args = parse_args()
+    ignore_required = (args.mode == "ignore-required")
+    mode_label      = "Ignore-Required" if ignore_required else "Normal"
+
+    print(f"Mode: {mode_label}")
     print("Reading Rules file (with GA4 values)...\n")
-    events = read_excel(RULES_FILE, SHEET_NAME)
+    events, input_columns, module_order = read_excel(RULES_FILE, SHEET_NAME)
 
     print("\nLoaded combinations:")
     for v in events.values():
         print(f"  → [{v['module'] or 'Uncategorized'}] {v['event_name']} | "
               f"platform={v['platform']} | params={len(v['params'])}")
 
-    result_df = validate(events)
+    print(f"\nModule order from input file ({len(module_order)} modules):")
+    for i, m in enumerate(module_order, 1):
+        print(f"  {i:>3}. {m}")
 
+    result_df = validate(events, ignore_required=ignore_required)
+
+    # Tag the output file with the mode so a normal run and an ignore-required
+    # run don't overwrite each other.
+    mode_tag = "_ignoreReq" if ignore_required else ""
     if KEEP_HISTORY:
         timestamp   = datetime.now(ZoneInfo('Asia/Kolkata')).strftime("%Y%m%d_%H%M%S")
-        output_path = OUTPUT_FILE.replace(".xlsx", f"_{timestamp}.xlsx")
+        output_path = OUTPUT_FILE.replace(".xlsx", f"{mode_tag}_{timestamp}.xlsx")
     else:
-        output_path = OUTPUT_FILE
+        output_path = OUTPUT_FILE.replace(".xlsx", f"{mode_tag}.xlsx") if mode_tag else OUTPUT_FILE
 
     app_metrics, app_mod_params = build_metrics_for_platform(
-        result_df, "APP", TOTAL_EVENTS_APP, TOTAL_MODULES_APP)
+        result_df, "APP", TOTAL_EVENTS_APP, TOTAL_MODULES_APP, module_order)
     web_metrics, web_mod_params = build_metrics_for_platform(
-        result_df, "WEB", TOTAL_EVENTS_WEB, TOTAL_MODULES_WEB)
+        result_df, "WEB", TOTAL_EVENTS_WEB, TOTAL_MODULES_WEB, module_order)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Drop internal columns from the user-facing Validation sheet
-        validation_view = result_df.drop(columns=["status", "_qa_checked"]).copy()
+        # ============================================================
+        # Build the Validation sheet view:
+        #   - Drop internal-only columns (prefixed with _ )
+        #   - Place original input columns FIRST (preserving input order)
+        #   - Append Status + Comments at the end
+        # Row order is module → event → param as they appeared in the input
+        # file (already enforced upstream by dict insertion + list append).
+        # ============================================================
+        internal_cols = [c for c in result_df.columns if c.startswith("_")]
+        validation_view = result_df.drop(columns=internal_cols).copy()
+
+        # Build the final column order: original input columns (those that exist
+        # in the result), then any other non-internal cols (which will be Status
+        # and Comments), preserving their order.
+        original_present = [c for c in input_columns if c in validation_view.columns]
+        extras = [c for c in validation_view.columns if c not in original_present]
+        ordered_cols = original_present + extras
+        validation_view = validation_view[ordered_cols]
+
         validation_view["Comments"] = validation_view["Comments"].fillna("").astype(str)
         validation_view.to_excel(writer, sheet_name="Validation", index=False)
 
         wb = writer.book
         val_ws = wb["Validation"]
 
-        # Direct fill the Status column based on value
         STATUS_COLOR_MAP = {
             "Pass":                 CF_GREEN_FILL,
             "Partial - Missing":    CF_YELLOW_FILL,
@@ -700,12 +848,25 @@ def main():
             if fill is not None:
                 cell.fill = fill
 
-        write_summary_sheet(wb, app_metrics, app_mod_params, web_metrics, web_mod_params)
+        write_summary_sheet(wb, app_metrics, app_mod_params,
+                            web_metrics, web_mod_params, module_order,
+                            mode_label=mode_label)
         wb.move_sheet("Summary", offset=-wb.sheetnames.index("Summary"))
 
     print(f"\n{'='*60}")
-    print("CONSOLE SUMMARY")
+    print(f"CONSOLE SUMMARY  (mode: {mode_label})")
     print(f"{'='*60}")
+
+    # (not set) detection — single line, easy to spot
+    if "_has_not_set" in result_df.columns:
+        ns_total = int(result_df["_has_not_set"].sum())
+        if ns_total:
+            ns_by_plat = (result_df[result_df["_has_not_set"]]
+                          .groupby("_platform").size().to_dict())
+            breakdown = ", ".join(f"{p}: {n}" for p, n in sorted(ns_by_plat.items()))
+            print(f"\n⚠ Rows containing (not set): {ns_total}  ({breakdown})")
+        else:
+            print("\n✓ No (not set) values detected in GA4 actual values.")
     for plat_label, m, mod_p in [("APP", app_metrics, app_mod_params),
                                   ("WEB", web_metrics, web_mod_params)]:
         print(f"\n{plat_label}")
